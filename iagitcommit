@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+model="${GITCOMMIT_CODEX_MODEL:-gpt-5.6-luna}"
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "Erreur : la commande 'codex' est introuvable." >&2
+  exit 1
+fi
+
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "Erreur : ce dossier n'est pas dans un dépôt Git." >&2
+  exit 1
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+branch="$(git branch --show-current)"
+if [[ -z "$branch" ]]; then
+  branch="detached"
+fi
+
+status="$(git status --short)"
+if [[ -z "$status" ]]; then
+  echo "Aucune modification à committer."
+  exit 0
+fi
+
+diff="$(git diff --no-ext-diff -- .)"
+staged_diff="$(git diff --cached --no-ext-diff -- .)"
+
+base_prompt=$(cat <<EOF
+Tu analyses les changements actuels du dépôt Git.
+
+Branche actuelle : $branch
+
+Statut Git :
+$status
+
+Diff des fichiers suivis :
+$diff
+
+Diff déjà indexé :
+$staged_diff
+
+Retourne uniquement un message de commit court en français au format :
+<type> <branche> <description>
+Par exemple : "fix feature/project-date formate l'entité des dates du projet".
+Le type doit être l'un de : fix, feat, style, refactor, test, docs, chore ou perf.
+Utilise exactement le nom de la branche fourni, puis décris brièvement en français ce que tu as compris.
+N'ajoute ni guillemets, ni markdown, ni explication. Si les changements sont mixtes,
+choisis le changement principal. N'invente pas de détail absent des changements.
+EOF
+)
+
+generate_message() {
+  local selected_type="${1:-}"
+  local type_instruction=""
+
+  if [[ -n "$selected_type" ]]; then
+    type_instruction="\nLe type choisi par l'utilisateur est : $selected_type. Utilise obligatoirement ce type et régénère la description en tenant compte des changements."
+  fi
+
+  codex exec \
+  --ephemeral \
+  --sandbox read-only \
+  --model "$model" \
+  -c model_reasoning_effort=none \
+  -C "$repo_root" \
+  "${base_prompt}${type_instruction}" | sed -e 's/^```[[:alnum:]_-]*$//' -e 's/^```$//' | sed '/^[[:space:]]*$/d' | head -n 1
+}
+
+message="$(generate_message)"
+
+message="$(printf '%s' "$message" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+
+if [[ -z "$message" ]]; then
+  echo "Erreur : Codex n'a pas généré de message de commit." >&2
+  exit 1
+fi
+
+printf 'Message proposé : %s\n' "$message"
+read -r -p "Indexer toutes les modifications et créer ce commit ? [Y/n] " confirmation
+if [[ ! "$confirmation" =~ ^[Yy]$ ]]; then
+  echo
+  echo "Choisis le type à utiliser pour régénérer le commentaire :"
+  echo "  feat     nouvelle fonctionnalité"
+  echo "  fix      correction de bug"
+  echo "  style    formatage ou style"
+  echo "  refactor restructuration du code"
+  echo "  test     ajout ou modification de tests"
+  echo "  docs     documentation"
+  echo "  chore    maintenance"
+  echo "  perf     amélioration des performances"
+  read -r -p "Type choisi (ou Entrée pour annuler) : " selected_type
+
+  if [[ -z "$selected_type" ]]; then
+    echo "Commit annulé."
+    exit 0
+  fi
+
+  if [[ ! "$selected_type" =~ ^(feat|fix|style|refactor|test|docs|chore|perf)$ ]]; then
+    echo "Erreur : type invalide."
+    exit 1
+  fi
+
+  message="$(generate_message "$selected_type")"
+  message="$(printf '%s' "$message" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  if [[ -z "$message" ]]; then
+    echo "Erreur : Codex n'a pas généré de message de commit." >&2
+    exit 1
+  fi
+
+  printf 'Nouveau message proposé : %s\n' "$message"
+  read -r -p "Indexer toutes les modifications et créer ce commit ? [y/N] " confirmation
+  if [[ ! "$confirmation" =~ ^[Yy]$ ]]; then
+    echo "Commit annulé."
+    exit 0
+  fi
+fi
+
+git add -A
+git commit -m "$message"
